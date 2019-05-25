@@ -1,0 +1,287 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Messenger Autoresponder pipeline stack
+Parameters:
+  PipelineName:
+    Default: sebcel-messenger-autoresponder-pipeline
+    Description: The name of the pipeline
+    Type: String
+  S3Bucket:
+    Default: sebcel-messenger-autoresponder-sources
+    Description: The name of the S3 bucket that contains the source artifact, which must be in the same region as this stack
+    Type: String
+  SourceS3Key:
+    Default: sebcel-messenger-autoresponder.zip
+    Description: The file name of the source artifact, such as myfolder/myartifact.zip
+    Type: String
+  TemplateFileName:
+    Default: sebcel-messenger-autoresponder-template.json
+    Description: The file name of the template
+    Type: String
+  TestStackName:
+    Default: sebcel-messenger-autoresponder-test-stack
+    Description: A name for the test stack
+    Type: String
+  TestStackConfig:
+    Default: test-stack-configuration.json
+    Description: The configuration file name for the test stack
+    Type: String
+  ProdStackName:
+    Default: sebcel-messenger-autoresponder-prod-stack
+    Description: A name for the production stack
+    Type: String
+  ProdStackConfig:
+    Default: prod-stack-configuration.json
+    Description: The configuration file name for the production stack
+    Type: String
+  ChangeSetName:
+    Default: sebcel-messenger-autoresponder-prod-stack-change-set
+    Description: A name for the prod stack change set
+    Type: String
+  Email:
+    Description: The email address where CodePipeline sends pipeline notifications
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "CodePipeline Settings"
+        Parameters:
+          - PipelineName
+          - S3Bucket
+          - SourceS3Key
+          - Email
+      - Label:
+          default: "Test Stack Settings"
+        Parameters:
+          - TestStackName
+          - TemplateFileName
+          - TestStackConfig
+      - Label:
+          default: "Production Stack Settings"
+        Parameters:
+          - ChangeSetName
+          - ProdStackName
+          - ProdStackConfig
+
+Resources:
+  ArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  CodePipelineSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref Email
+          Protocol: email
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref 'ArtifactStoreBucket'
+        Type: S3
+      DisableInboundStageTransitions: []
+      Name: !Ref 'PipelineName'
+      RoleArn: !GetAtt [PipelineRole, Arn]
+      Stages:
+        - Name: S3Source
+          Actions:
+            - Name: TemplateSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref 'S3Bucket'
+                S3ObjectKey: !Ref 'SourceS3Key'
+              OutputArtifacts:
+                - Name: TemplateSource
+              RunOrder: '1'
+        - Name: TestStage
+          Actions:
+            - Name: CreateStack
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: TemplateSource
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                RoleArn: !GetAtt [CFNRole, Arn]
+                Capabilities: CAPABILITY_NAMED_IAM
+                StackName: !Ref TestStackName
+                TemplateConfiguration: !Sub "TemplateSource::${TestStackConfig}"
+                TemplatePath: !Sub "TemplateSource::${TemplateFileName}"
+              RunOrder: '1'
+            - Name: ApproveTestStack
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref CodePipelineSNSTopic
+                CustomData: !Sub 'Do you want to create a change set against the production stack and delete the ${TestStackName} stack?'
+              RunOrder: '2'
+        - Name: ProdStage
+          Actions:
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: TemplateSource
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                RoleArn: !GetAtt [CFNRole, Arn]
+                Capabilities: CAPABILITY_NAMED_IAM
+                StackName: !Ref ProdStackName
+                ChangeSetName: !Ref ChangeSetName
+                TemplateConfiguration: !Sub "TemplateSource::${ProdStackConfig}"
+                TemplatePath: !Sub "TemplateSource::${TemplateFileName}"
+              RunOrder: '1'
+            - Name: ApproveChangeSet
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref CodePipelineSNSTopic
+                CustomData: !Sub 'A new change set was created for the ${ProdStackName} stack. Do you want to implement the changes?'
+              RunOrder: '2'
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: !Ref ChangeSetName
+                RoleArn: !GetAtt [CFNRole, Arn]
+                StackName: !Ref ProdStackName
+              RunOrder: '3'
+  CFNRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: sebcel-messenger-autoresponder-cloudformation-role
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [cloudformation.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: sebcel-messenger-autoresponder-cloudformation-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 'iam:CreateRole'
+                - 'iam:GetRole'
+                - 'iam:DeleteRole'
+                - 'iam:PassRole'
+                - 'iam:PutRolePolicy'
+                - 'iam:DeleteRolePolicy'
+                - 'dynamodb:DescribeTable'
+                - 'dynamodb:CreateTable'
+                - 'dynamodb:DeleteTable'
+                - 'dynamodb:UpdateTable'
+                - 'dynamodb:ListTagsOfResource'
+                - 'dynamodb:TagResource'
+                - 'dynamodb:UntagResource'
+                - 'lambda:CreateFunction'
+                - 'lambda:DeleteFunction'
+                - 'lambda:GetFunction'
+                - 'lambda:GetFunctionConfiguration'
+                - 'lambda:UpdateFunctionConfiguration'
+                - 'lambda:ListTags'
+                - 'lambda:TagResource'
+                - 'lambda:UntagResource'
+                - 'apigateway:PUT'
+                - 'apigateway:POST'
+                - 'apigateway:DELETE'
+                - 'apigateway:GET'
+                - 'apigateway:PATCH'
+                - 'apigateway:UpdateRestApiPolicy'
+                - 'cognito-idp:DescribeUserPool'
+                - 'cognito-idp:CreateUserPool'
+                - 'cognito-idp:UpdateUserPool'
+                - 'cognito-idp:DeleteUserPool'
+                - 'cognito-idp:CreateUserPoolClient'
+                - 'cognito-idp:DeleteUserPoolClient'
+                - 'cognito-idp:UpdateUserPoolClient'
+                - 'logs:DescribeLogGroups'
+                - 'logs:CreateLogGroup'
+                - 'logs:DeleteLogGroup'
+                - 'logs:PutRetentionPolicy'
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                - 's3:*'
+                Effect: Allow
+                Resource: '*'
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: sebcel-messenger-autoresponder-pipeline-role
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [codepipeline.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: sebcel-messenger-autoresponder-pipeline-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 's3:*'
+                - 'cloudformation:CreateStack'
+                - 'cloudformation:DescribeStacks'
+                - 'cloudformation:DeleteStack'
+                - 'cloudformation:UpdateStack'
+                - 'cloudformation:CreateChangeSet'
+                - 'cloudformation:ExecuteChangeSet'
+                - 'cloudformation:DeleteChangeSet'
+                - 'cloudformation:DescribeChangeSet'
+                - 'cloudformation:SetStackPolicy'
+                - 'iam:PassRole'
+                - 'sns:Publish'
+                Effect: Allow
+                Resource: '*'
+  PipelineUpdateUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: "sebcel-messenger-autoresponder-pipeline-update-user"
+  PipelineUpdatePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: "sebcel-messenger-autoresponder-pipeline-update-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - "cloudformation:UpdateStack"
+            Resource:
+              - !Ref AWS::StackName
+      Users:
+        - !Ref PipelineUpdateUser
